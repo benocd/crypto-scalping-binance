@@ -4,6 +4,10 @@ import time
 import hmac
 import hashlib
 import json
+import sys
+import os
+import csv
+from datetime import datetime
 
 # Binance API URLs
 BASE_URL = "https://api.binance.com"
@@ -11,29 +15,50 @@ KLINES_ENDPOINT = "/api/v3/klines"
 TICKER_ENDPOINT = "/api/v3/ticker/24hr"
 ORDER_ENDPOINT = "/api/v3/order"
 
-# Binance API keys (replace with your own keys)
-API_KEY = "your_api_key"
-API_SECRET = "your_api_secret"
+# Load API credentials from config.json
+def load_api_keys():
+    with open("config.json", "r") as file:
+        config = json.load(file)
+    return config["api_key"], config["api_secret"]
+
+API_KEY, API_SECRET = load_api_keys()
+
+BINANCE_FEE_RATE = 0.001  # 0.1% per trade, total 0.2% round-trip
 
 # Trading configurations for different pairs
 TRADING_CONFIG = {
-    "DOGEUSDT": {"trade_size": 50, "sl_adjust": 0.002, "tp_adjust": 0.005},
-    "ETHUSDT": {"trade_size": 0.01, "sl_adjust": 5, "tp_adjust": 15},
-    "BTCUSDT": {"trade_size": 0.001, "sl_adjust": 100, "tp_adjust": 300}
+    "BTCUSDT": {"trade_size": 0.0001, "sl_adjust": 100, "tp_adjust": 300},
+    "ETHUSDT": {"trade_size": 0.005, "sl_adjust": 5, "tp_adjust": 15},
+    "DOGEUSDT": {"trade_size": 50, "sl_adjust": 0.002, "tp_adjust": 0.005}
 }
 
-# Define trading pair
-TRADING_PAIR = "DOGEUSDT"  # Change this as needed
-CONFIG = TRADING_CONFIG[TRADING_PAIR]
+# Function to log trade details
+def log_trade(symbol, side, quantity, timestamp):
+    now = datetime.now()
+    log_filename = f"logs/{now.year}_{now.month}.csv"
+
+    # Check if file exists to write headers
+    file_exists = os.path.isfile(log_filename)
+
+    with open(log_filename, mode="a", newline="") as file:
+        writer = csv.writer(file)
+
+        # Write headers if file is new
+        if not file_exists:
+            writer.writerow(["Timestamp", "Symbol", "Side", "Quantity"])
+
+        # Log trade details
+        writer.writerow([datetime.fromtimestamp(timestamp / 1000).strftime("%Y-%m-%d %H:%M:%S"), symbol, side, quantity])
+
 
 # Fetch historical kline (candlestick) data
-def get_klines(symbol=TRADING_PAIR, interval="5m", limit=50):
+def get_klines(symbol, interval="5m", limit=50):
     url = f"{BASE_URL}{KLINES_ENDPOINT}?symbol={symbol}&interval={interval}&limit={limit}"
     response = requests.get(url)
     return response.json()
 
 # Fetch 24hr ticker data
-def get_ticker(symbol=TRADING_PAIR):
+def get_ticker(symbol):
     url = f"{BASE_URL}{TICKER_ENDPOINT}?symbol={symbol}"
     response = requests.get(url)
     return response.json()
@@ -52,6 +77,12 @@ def place_order(symbol, side, quantity, price=None, order_type="MARKET"):
         "quantity": quantity,
         "timestamp": timestamp
     }
+
+    # If selling, account for the fee deduction
+    if side == "SELL":
+        quantity_after_fee = quantity * (1 - BINANCE_FEE_RATE)
+        params["quantity"] = round(quantity_after_fee, 8)  # Binance typically accepts up to 8 decimals
+
     if order_type == "LIMIT":
         params["price"] = price
         params["timeInForce"] = "GTC"
@@ -62,31 +93,43 @@ def place_order(symbol, side, quantity, price=None, order_type="MARKET"):
     headers = {"X-MBX-APIKEY": API_KEY}
     
     response = requests.post(f"{BASE_URL}{ORDER_ENDPOINT}", headers=headers, params=params)
-    return response.json()
+    order_response = response.json()
+
+    # Handle insufficient balance error
+    if "code" in order_response and order_response["code"] == -2010:
+        print("❌ ERROR: Insufficient balance. Stopping the script.")
+        sys.exit(1)  # Exit program immediately
+    else:
+        try:
+            log_trade(symbol, side, quantity, timestamp)
+        except Exception as e:
+            print(f"⚠️ WARNING: Failed to write log due to: {e}")
+
+    return order_response
 
 # Monitor price after trade execution
-def monitor_trade(entry_price, stop_loss, take_profit):
+def monitor_trade(symbol, entry_price, stop_loss, take_profit, trade_size):
     while True:
-        ticker = get_ticker()
+        ticker = get_ticker(symbol)
         current_price = float(ticker["lastPrice"])
         
-        print(f"Monitoring trade: Current Price {current_price:.6f}, TP {take_profit:.6f}, SL {stop_loss:.6f}")
+        print(f"📊 Monitoring {symbol}: Current Price {current_price:.6f}, TP {take_profit:.6f}, SL {stop_loss:.6f}")
         
         if current_price >= take_profit:
-            print("Take Profit reached! Selling...")
-            place_order(TRADING_PAIR, "SELL", CONFIG["trade_size"])
+            print("🎯 Take Profit reached! Selling...")
+            place_order(symbol, "SELL", trade_size)
             break
         elif current_price <= stop_loss:
-            print("Stop Loss triggered! Selling...")
-            place_order(TRADING_PAIR, "SELL", CONFIG["trade_size"])
+            print("🛑 Stop Loss triggered! Selling...")
+            place_order(symbol, "SELL", trade_size)
             break
         
         time.sleep(10)
 
-# Perform analysis and execute trades
-def analyze_market():
-    klines = get_klines()
-    ticker = get_ticker()
+# Perform analysis and execute trades for a given pair
+def analyze_market(symbol, config):
+    klines = get_klines(symbol)
+    ticker = get_ticker(symbol)
     
     close_prices = np.array([float(candle[4]) for candle in klines])
     ma3 = moving_average(close_prices, 3)
@@ -104,12 +147,17 @@ def analyze_market():
     
     support = low_price if low_price > ma21 else ma21
     resistance = max(ma3, ma9)
+
+    stop_loss = support - config["sl_adjust"]
     
-    stop_loss = support - CONFIG["sl_adjust"]
-    take_profit = resistance + CONFIG["tp_adjust"]
-    
+    # Calculate adjusted TP to ensure it covers Binance fees
+    min_tp_adjust = close_price * BINANCE_FEE_RATE * 2  # Minimum TP needed to cover fees
+    final_tp_adjust = max(config["tp_adjust"], min_tp_adjust)  # Ensure TP is profitable
+
+    take_profit = resistance + final_tp_adjust  # Use adjusted TP
+
     trade_plan = f"""
-    {TRADING_PAIR} Scalping Analysis:
+    📊 {symbol} Scalping Analysis:
     ----------------------------
     - Current Price: {close_price:.6f} USDT
     - Price Action: {trend} ({momentum} Momentum)
@@ -125,18 +173,22 @@ def analyze_market():
     Scalping Strategy:
     - Quick Entry: {ma3:.6f} (if price bounces above MA3)
     - Trend Confirmation: {ma9:.6f} (if price holds above MA9)
-    - Stop Loss: {stop_loss:.6f}
-    - Take Profit: {take_profit:.6f}
+    - 🛑 Stop Loss: {stop_loss:.6f}
+    - 🎯 Take Profit: {take_profit:.6f}
     """
     print(trade_plan)
     
     if close_price > ma3 and close_price > ma9:
-        print("Placing Market Buy Order...")
-        order_response = place_order(TRADING_PAIR, "BUY", CONFIG["trade_size"])
+        print(f"🚀 Placing Market Buy Order for {symbol}...")
+        order_response = place_order(symbol, "BUY", config["trade_size"])
         print("Order Response:", json.dumps(order_response, indent=4))
         
-        print(f"Setting Take Profit at {take_profit:.6f} and Stop Loss at {stop_loss:.6f}")
-        monitor_trade(close_price, stop_loss, take_profit)
-    
+        print(f"Setting TP at {take_profit:.6f} and SL at {stop_loss:.6f}")
+        monitor_trade(symbol, close_price, stop_loss, take_profit, config["trade_size"])
+
+# Main Loop: Iterate through all pairs
 if __name__ == "__main__":
-    analyze_market()
+    while True:
+        for pair, config in TRADING_CONFIG.items():
+            analyze_market(pair, config)
+            time.sleep(5)  # Wait before switching to the next pair
